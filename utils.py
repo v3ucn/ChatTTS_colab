@@ -4,9 +4,16 @@ except ImportError:
     print("The 'cn2an' module is not installed. Please install it using 'pip install cn2an'.")
     exit(1)
 
+try:
+    import jieba
+except ImportError:
+    print("The 'jieba' module is not installed. Please install it using 'pip install jieba'.")
+    exit(1)
+
 import re
 import numpy as np
 import wave
+import jieba.posseg as pseg
 
 
 def save_audio(file_name, audio, rate=24000):
@@ -17,13 +24,20 @@ def save_audio(file_name, audio, rate=24000):
     :param rate:
     :return:
     """
+    import os
+    from config import DEFAULT_DIR
     audio = (audio * 32767).astype(np.int16)
 
-    with wave.open(file_name, "w") as wf:
+    # 检查默认目录
+    if not os.path.exists(DEFAULT_DIR):
+        os.makedirs(DEFAULT_DIR)
+    full_path = os.path.join(DEFAULT_DIR, file_name)
+    with wave.open(full_path, "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(rate)
         wf.writeframes(audio.tobytes())
+    return full_path
 
 
 def combine_audio(wavs):
@@ -87,10 +101,26 @@ def remove_chinese_punctuation(text):
     :param text:
     :return:
     """
-    chinese_punctuation_pattern = r"[：；！（），【】『』「」《》－‘“’”:,;!\(\)\[\]><\-]"
-    text = re.sub(chinese_punctuation_pattern, ' ', text)
+    chinese_punctuation_pattern = r"[：；！（），【】『』「」《》－‘“’”:,;!\(\)\[\]><\-·]"
+    text = re.sub(chinese_punctuation_pattern, '，', text)
     # 使用正则表达式将多个连续的句号替换为一个句号
-    text = re.sub(r'。{2,}', '。', text)
+    text = re.sub(r'[。，]{2,}', '。', text)
+    # 删除开头和结尾的 ， 号
+    text = re.sub(r'^，|，$', '', text)
+    return text
+
+def remove_english_punctuation(text):
+    """
+    移除文本中的中文标点符号 [：；！（），【】『』「」《》－‘“’”:,;!\(\)\[\]><\-] 替换为 ，
+    :param text:
+    :return:
+    """
+    chinese_punctuation_pattern = r"[：；！（），【】『』「」《》－‘“’”:,;!\(\)\[\]><\-·]"
+    text = re.sub(chinese_punctuation_pattern, ',', text)
+    # 使用正则表达式将多个连续的句号替换为一个句号
+    text = re.sub(r'[,\.]{2,}', '.', text)
+    # 删除开头和结尾的 ， 号
+    text = re.sub(r'^,|,$', '', text)
     return text
 
 
@@ -108,9 +138,9 @@ def text_normalize(text):
 
     _txt = ''.join(sentences)
     # 替换掉除中文之外的所有字符
-    _txt = re.sub(
-        r"[^\u4e00-\u9fa5，。！？、]+", "", _txt
-    )
+    # _txt = re.sub(
+    #     r"[^\u4e00-\u9fa5，。！？、]+", "", _txt
+    # )
 
     return _txt
 
@@ -124,6 +154,20 @@ def convert_numbers_to_chinese(text):
     return cn2an.transform(text, "an2cn")
 
 
+def detect_language(sentence):
+    # ref: https://github.com/2noise/ChatTTS/blob/main/ChatTTS/utils/infer_utils.py#L55
+    chinese_char_pattern = re.compile(r'[\u4e00-\u9fff]')
+    english_word_pattern = re.compile(r'\b[A-Za-z]+\b')
+
+    chinese_chars = chinese_char_pattern.findall(sentence)
+    english_words = english_word_pattern.findall(sentence)
+
+    if len(chinese_chars) > len(english_words):
+        return "zh"
+    else:
+        return "en"
+
+
 def split_text(text, min_length=60):
     """
     将文本分割为长度不小于min_length的句子
@@ -131,33 +175,58 @@ def split_text(text, min_length=60):
     :param min_length:
     :return:
     """
-    sentence_delimiters = re.compile(r'([。？！\.\n]+)')
-    sentences = re.split(sentence_delimiters, text)
-    # print(sentences)
-    # exit()
+    # 短句分割符号
+    sentence_delimiters = re.compile(r'([。？！\.]+)')
+    # 匹配多个连续的回车符 作为段落点 强制分段
+    paragraph_delimiters = re.compile(r'(\s*\n\s*)+')
+
+    paragraphs = re.split(paragraph_delimiters, text)
+
     result = []
-    current_sentence = ''
-    for sentence in sentences:
-        if re.match(sentence_delimiters, sentence):
-            current_sentence += sentence.strip() + '。'
-            if len(current_sentence) >= min_length:
-                result.append(current_sentence.strip())
-                current_sentence = ''
-        else:
-            current_sentence += sentence.strip()
-    if current_sentence:
-        if len(current_sentence) < min_length and len(result) > 0:
-            result[-1] += current_sentence
-        else:
-            result.append(current_sentence)
-    # result = [convert_numbers_to_chinese(remove_chinese_punctuation(_.strip())) for _ in result if _.strip()]
-    result = [normalize_zh(_.strip()) for _ in result if _.strip()]
+
+    for paragraph in paragraphs:
+        if not paragraph.strip():
+            continue  # 跳过空段落
+        # 小于阈值的段落直接分开
+        if len(paragraph.strip()) < min_length:
+            result.append(paragraph.strip())
+            continue
+        print('paragraph', paragraph)
+        # 大于的再计算拆分
+        sentences = re.split(sentence_delimiters, paragraph)
+        current_sentence = ''
+        print('sentences', sentences)
+
+        for sentence in sentences:
+            if re.match(sentence_delimiters, sentence):
+                current_sentence += sentence.strip() + ''
+                if len(current_sentence) >= min_length:
+                    result.append(current_sentence.strip())
+                    current_sentence = ''
+            else:
+                current_sentence += sentence.strip()
+
+        if current_sentence:
+            if len(current_sentence) < min_length and len(result) > 0:
+                result[-1] += current_sentence
+            else:
+                result.append(current_sentence)
+    print("result", result)
+    if detect_language(text[:1024]) == "zh":
+        result = [normalize_zh(_.strip()) for _ in result if _.strip()]
+    else:
+        result = [normalize_en(_.strip()) for _ in result if _.strip()]
     return result
 
 
+def normalize_en(text):
+    from tn.english.normalizer import Normalizer
+    normalizer = Normalizer()
+    return remove_english_punctuation(normalizer.normalize(text))
+
+
 def normalize_zh(text):
-    # return text_normalize(remove_chinese_punctuation(text))
-    return convert_numbers_to_chinese(remove_chinese_punctuation(text))
+    return process_ddd(text_normalize(remove_chinese_punctuation(text)))
 
 
 def batch_split(items, batch_size=5):
@@ -189,11 +258,76 @@ def read_long_text(file_path):
     raise ValueError("无法识别文件编码")
 
 
+def replace_tokens(text):
+    remove_tokens = ['UNK']
+    for token in remove_tokens:
+        text = re.sub(r'\[' + re.escape(token) + r'\]', '', text)
+
+    tokens = ['uv_break', 'laugh','lbreak']
+    for token in tokens:
+        text = re.sub(r'\[' + re.escape(token) + r'\]', f'uu{token}uu', text)
+        text = text.replace('_', '')
+    return text
+
+
+def restore_tokens(text):
+    tokens = ['uvbreak', 'laugh', 'UNK', 'lbreak']
+    for token in tokens:
+        text = re.sub(r'uu' + re.escape(token) + r'uu', f'[{token}]', text)
+    text = text.replace('[uvbreak]', '[uv_break]')
+    return text
+
+
+def process_ddd(text):
+    """
+    处理“地”、“得” 字的使用，都替换为“的”
+    依据：地、得的使用，主要是在动词和形容词前后，本方法没有严格按照语法替换，因为时常遇到用错的情况。
+    另外受 jieba 分词准确率的影响，部分情况下可能会出漏掉。例如：小红帽疑惑地问
+    :param text: 输入的文本
+    :return: 处理后的文本
+    """
+    word_list = [(word, flag) for word, flag in pseg.cut(text, use_paddle=False)]
+    # print(word_list)
+    processed_words = []
+    for i, (word, flag) in enumerate(word_list):
+        if word in ["地", "得"]:
+            # Check previous and next word's flag
+            # prev_flag = word_list[i - 1][1] if i > 0 else None
+            # next_flag = word_list[i + 1][1] if i + 1 < len(word_list) else None
+
+            # if prev_flag in ['v', 'a'] or next_flag in ['v', 'a']:
+            if flag in ['uv', 'ud']:
+                processed_words.append("的")
+            else:
+                processed_words.append(word)
+        else:
+            processed_words.append(word)
+
+    return ''.join(processed_words)
+
+
+def replace_space_between_chinese(text):
+    return re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', text)
+
+
 if __name__ == '__main__':
+    # txts = [
+    #     "快速地跑过红色的大门",
+    #     "笑得很开心，学得很好",
+    #     "小红帽疑惑地问？",
+    #     "大灰狼慌张地回答",
+    #     "哦，这是为了更好地听你说话。",
+    #     "大灰狼不耐烦地说：“为了更好地抱你。”",
+    #     "他跑得很快，工作做得非常认真，这是他努力地结果。得到",
+    # ]
+    # for txt in txts:
+    #     print(txt, '-->', process_ddd(txt))
+
     txts = [
         "电影中梁朝伟扮演的陈永仁的编号27149",
         "这块黄金重达324.75克 我们班的最高总分为583分",
         "12\~23 -1.5\~2",
+        "居维埃·拉色别德①、杜梅里②、卡特法日③，"
 
     ]
     for txt in txts:

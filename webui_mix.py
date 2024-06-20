@@ -1,3 +1,7 @@
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
 import argparse
 import re
 import time
@@ -6,11 +10,12 @@ import pandas
 import numpy as np
 from tqdm import tqdm
 import random
-import os
 import gradio as gr
 import json
-from utils import combine_audio, save_audio, batch_split, normalize_zh
-from tts_model import load_chat_tts_model, clear_cuda_cache, deterministic, generate_audio_for_seed
+from utils import batch_split, normalize_zh
+from tts_model import load_chat_tts_model, clear_cuda_cache, generate_audio_for_seed
+from config import DEFAULT_BATCH_SIZE, DEFAULT_SPEED, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P, DEFAULT_ORAL, \
+    DEFAULT_LAUGH, DEFAULT_BK, DEFAULT_SEG_LENGTH
 
 parser = argparse.ArgumentParser(description="Gradio ChatTTS MIX")
 parser.add_argument("--source", type=str, default="huggingface", help="Model source: 'huggingface' or 'local'.")
@@ -39,7 +44,7 @@ if not os.path.exists(SAVED_SEEDS_FILE):
 
 chat = load_chat_tts_model(source=args.source, local_path=args.local_path)
 # chat = None
-# chat = load_chat_tts_model(source="local", local_path="models")
+# chat = load_chat_tts_model(source="local", local_path=r"models")
 
 # 抽卡的最大数量
 max_audio_components = 10
@@ -55,14 +60,22 @@ max_audio_components = 10
 def load_seeds():
     with open(SAVED_SEEDS_FILE, "r") as f:
         global saved_seeds
-        saved_seeds = json.load(f)
+
+        seeds = json.load(f)
+
+        # 兼容旧的 JSON 格式，添加 path 字段
+        for seed in seeds:
+            if 'path' not in seed:
+                seed['path'] = None
+
+        saved_seeds = seeds
     return saved_seeds
 
 
 def display_seeds():
     seeds = load_seeds()
     # 转换为 List[List] 的形式
-    return [[i, s['seed'], s['name']] for i, s in enumerate(seeds)]
+    return [[i, s['seed'], s['name'], s['path']] for i, s in enumerate(seeds)]
 
 
 saved_seeds = load_seeds()
@@ -77,13 +90,14 @@ def save_seeds():
 
 
 # 添加 seed
-def add_seed(seed, name, save=True):
+def add_seed(seed, name, audio_path, save=True):
     for s in saved_seeds:
         if s['seed'] == seed:
             return False
     saved_seeds.append({
         'seed': seed,
-        'name': name
+        'name': name,
+        'path': audio_path
     })
     if save:
         save_seeds()
@@ -128,7 +142,7 @@ def generate_seeds(num_seeds, texts, tq):
     for _ in tq(range(num_seeds), desc=f"随机音色生成中..."):
         seed = np.random.randint(0, 9999)
 
-        filename = generate_audio_for_seed(chat, seed, texts, 1, 5, "[oral_2][laugh_0][break_4]", 0.3, 0.7, 20)
+        filename = generate_audio_for_seed(chat, seed, texts, 1, 5, "[oral_2][laugh_0][break_4]", None, 0.3, 0.7, 20)
         seeds.append((filename, seed))
         clear_cuda_cache()
 
@@ -136,11 +150,12 @@ def generate_seeds(num_seeds, texts, tq):
 
 
 # 保存选定的音频种子
-def do_save_seed(seed):
+def do_save_seed(seed, audio_path):
+    print(f"Saving seed {seed} to {audio_path}")
     seed = seed.replace('保存种子 ', '').strip()
     if not seed:
         return
-    add_seed(int(seed), seed)
+    add_seed(int(seed), seed, audio_path)
     gr.Info(f"Seed {seed} has been saved.")
 
 
@@ -172,11 +187,24 @@ def do_delete_seed(val):
     return display_seeds()
 
 
+# 定义播放音频的函数
+def do_play_seed(val):
+    # 从 val 匹配 [(\d+)] 获取index
+    index = re.search(r'\[(\d+)\]', val)
+    if index:
+        index = int(index.group(1))
+        seed = saved_seeds[index]['seed']
+        audio_path = saved_seeds[index]['path']
+        if audio_path:
+            return gr.update(visible=True, value=audio_path)
+    return gr.update(visible=False, value=None)
+
+
 def seed_change_btn():
     global SELECTED_SEED_INDEX
     if SELECTED_SEED_INDEX == -1:
-        return '删除'
-    return f'删除 idx=[{SELECTED_SEED_INDEX[0]}]'
+        return ['删除', '试听']
+    return [f'删除 idx=[{SELECTED_SEED_INDEX[0]}]', f'试听 idx=[{SELECTED_SEED_INDEX[0]}]']
 
 
 def audio_interface(num_seeds, texts, progress=gr.Progress()):
@@ -193,11 +221,26 @@ def audio_interface(num_seeds, texts, progress=gr.Progress()):
     # 不足的部分
     all_wavs = wavs + [None] * (max_audio_components - len(wavs))
     all_seeds = seeds + [''] * (max_audio_components - len(seeds))
-    return [item for pair in zip(all_wavs, all_seeds) for item in pair]
+    return [item for pair in zip(all_wavs, all_seeds, all_wavs) for item in pair]
+
+
+# 保存刚刚生成的种子文件路径
+audio_paths = [gr.State(value=None) for _ in range(max_audio_components)]
+
+
+def audio_interface_with_paths(num_seeds, texts, progress=gr.Progress()):
+    """
+    比 audio_interface 多携带音频的 path
+    """
+    results = audio_interface(num_seeds, texts, progress)
+    wavs = results[::2]  # 提取音频文件路径
+    for i, wav in enumerate(wavs):
+        audio_paths[i].value = wav  # 直接为 State 组件赋值
+    return results
 
 
 def audio_interface_empty(num_seeds, texts, progress=gr.Progress(track_tqdm=True)):
-    return [None, ""] * max_audio_components
+    return [None, "", None] * max_audio_components
 
 
 def update_audio_components(slider_value):
@@ -205,8 +248,9 @@ def update_audio_components(slider_value):
     k = int(slider_value)
     audios = [gr.Audio(visible=True)] * k + [gr.Audio(visible=False)] * (max_audio_components - k)
     tbs = [gr.Textbox(visible=True)] * k + [gr.Textbox(visible=False)] * (max_audio_components - k)
+    stats = [gr.State(value=None)] * max_audio_components
     print(f'k={k}, audios={len(audios)}')
-    return [item for pair in zip(audios, tbs) for item in pair]
+    return [item for pair in zip(audios, tbs, stats) for item in pair]
 
 
 def seed_change(evt: gr.SelectData):
@@ -217,9 +261,9 @@ def seed_change(evt: gr.SelectData):
 
 
 def generate_tts_audio(text_file, num_seeds, seed, speed, oral, laugh, bk, min_length, batch_size, temperature, top_P,
-                       top_K, progress=gr.Progress()):
+                       top_K, roleid=None, refine_text=True, speaker_type="seed", pt_file=None, progress=gr.Progress()):
     from tts_model import generate_audio_for_seed
-    from utils import split_text
+    from utils import split_text, replace_tokens, restore_tokens
     if seed in [0, -1, None]:
         seed = random.randint(1, 9999)
     content = ''
@@ -227,19 +271,64 @@ def generate_tts_audio(text_file, num_seeds, seed, speed, oral, laugh, bk, min_l
         content = ""
     elif isinstance(text_file, str):
         content = text_file
+    # 将  [uv_break]  [laugh] 替换为 _uv_break_ _laugh_ 处理后再还原
+    content = replace_tokens(content)
     texts = split_text(content, min_length=min_length)
-    print(texts)
+    for i, text in enumerate(texts):
+        texts[i] = restore_tokens(text)
 
     if oral < 0 or oral > 9 or laugh < 0 or laugh > 2 or bk < 0 or bk > 7:
         raise ValueError("oral_(0-9), laugh_(0-2), break_(0-7) out of range")
 
     refine_text_prompt = f"[oral_{oral}][laugh_{laugh}][break_{bk}]"
     try:
-        output_files = generate_audio_for_seed(chat, seed, texts, batch_size, speed, refine_text_prompt, temperature,
-                                               top_P, top_K, progress.tqdm)
+        output_files = generate_audio_for_seed(
+            chat=chat,
+            seed=seed,
+            texts=texts,
+            batch_size=batch_size,
+            speed=speed,
+            refine_text_prompt=refine_text_prompt,
+            roleid=roleid,
+            temperature=temperature,
+            top_P=top_P,
+            top_K=top_K,
+            cur_tqdm=progress.tqdm,
+            skip_save=False,
+            skip_refine_text=not refine_text,
+            speaker_type=speaker_type,
+            pt_file=pt_file,
+        )
         return output_files
     except Exception as e:
-        return str(e)
+        raise e
+
+
+def generate_refine(text_file, oral, laugh, bk, temperature, top_P, top_K, progress=gr.Progress()):
+    from tts_model import generate_refine_text
+    from utils import split_text, replace_tokens, restore_tokens, replace_space_between_chinese
+    seed = random.randint(1, 9999)
+    refine_text_prompt = f"[oral_{oral}][laugh_{laugh}][break_{bk}]"
+    content = ''
+    if os.path.isfile(text_file):
+        content = ""
+    elif isinstance(text_file, str):
+        content = text_file
+    if re.search(r'\[uv_break\]|\[laugh\]', content) is not None:
+        gr.Info("检测到 [uv_break] [laugh]，不能重复 refine ")
+        # print("检测到 [uv_break] [laugh]，不能重复 refine ")
+        return content
+    batch_size = 5
+
+    content = replace_tokens(content)
+    texts = split_text(content, min_length=120)
+    print(texts)
+    for i, text in enumerate(texts):
+        texts[i] = restore_tokens(text)
+    txts = []
+    for batch in progress.tqdm(batch_split(texts, batch_size), desc=f"Refine Text Please Wait ..."):
+        txts.extend(generate_refine_text(chat, seed, batch, refine_text_prompt, temperature, top_P, top_K))
+    return replace_space_between_chinese('\n\n'.join(txts))
 
 
 def generate_seed():
@@ -252,10 +341,28 @@ def generate_seed():
 
 def update_label(text):
     word_count = len(text)
-    return gr.update(label=f"朗读文本（字数: {word_count}）")
+    return gr.update(label=f"朗读文本（{word_count} 字）")
+
+
+def inser_token(text, btn):
+    if btn == "+笑声":
+        return gr.update(
+            value=text + "[laugh]"
+        )
+    elif btn == "+停顿":
+        return gr.update(
+            value=text + "[uv_break]"
+        )
 
 
 with gr.Blocks() as demo:
+    # 项目链接
+    gr.Markdown("""
+        <div style='text-align: center; font-size: 16px;'>
+            🌟  <a href='https://github.com/6drf21e/ChatTTS_colab'>项目地址 欢迎 start</a> 🌟
+        </div>
+        """)
+
     with gr.Tab("音色抽卡"):
         with gr.Row():
             with gr.Column(scale=1):
@@ -282,21 +389,29 @@ with gr.Blocks() as demo:
                 gr.Markdown("### 种子管理界面")
                 seed_list = gr.DataFrame(
                     label="种子列表",
-                    headers=["Index", "Seed", "Name"],
-                    datatype=["number", "number", "str"],
+                    headers=["Index", "Seed", "Name", "Path"],
+                    datatype=["number", "number", "str", "str"],
                     interactive=True,
-                    col_count=(3, "fixed"),
-                    value=display_seeds()
+                    col_count=(4, "fixed"),
+                    value=display_seeds
                 )
+
                 with gr.Row():
                     refresh_button = gr.Button("刷新")
                     save_button = gr.Button("保存")
                     del_button = gr.Button("删除")
+                    play_button = gr.Button("试听")
+
+                with gr.Row():
+                    # 添加已保存的种子音频播放组件
+                    audio_player = gr.Audio(label="播放已保存种子音频", visible=False)
+
                 # 绑定按钮和函数
                 refresh_button.click(display_seeds, outputs=seed_list)
-                seed_list.select(seed_change).success(seed_change_btn, outputs=[del_button])
+                seed_list.select(seed_change).success(seed_change_btn, outputs=[del_button, play_button])
                 save_button.click(do_save_seeds, inputs=[seed_list], outputs=None)
                 del_button.click(do_delete_seed, inputs=del_button, outputs=seed_list)
+                play_button.click(do_play_seed, inputs=play_button, outputs=audio_player)
 
             with gr.Column(scale=1):
                 audio_components = []
@@ -304,12 +419,13 @@ with gr.Blocks() as demo:
                     visible = i < num_seeds_default
                     a = gr.Audio(f"Audio {i}", visible=visible)
                     t = gr.Button(f"Seed", visible=visible)
-                    t.click(do_save_seed, inputs=[t], outputs=None).success(display_seeds, outputs=seed_list)
+                    s = gr.State(value=None)
+                    t.click(do_save_seed, inputs=[t, s], outputs=None).success(display_seeds, outputs=seed_list)
                     audio_components.append(a)
                     audio_components.append(t)
+                    audio_components.append(s)
 
                 num_seeds.change(update_audio_components, inputs=num_seeds, outputs=audio_components)
-
                 # output = gr.Column()
                 # audio = gr.Audio(label="Output Audio")
 
@@ -329,33 +445,70 @@ with gr.Blocks() as demo:
                                              placeholder="Please Input Text...", value=default_text)
                 # 当文本框内容发生变化时调用 update_label 函数
                 text_file_input.change(update_label, inputs=text_file_input, outputs=text_file_input)
+                # 加入停顿按钮
+                with gr.Row():
+                    break_button = gr.Button("+停顿", variant="secondary")
+                    laugh_button = gr.Button("+笑声", variant="secondary")
+                refine_button = gr.Button("Refine Text（预处理 加入停顿词、笑声等）", variant="secondary")
 
             with gr.Column():
                 gr.Markdown("### 配置参数")
-                gr.Markdown("根据需要配置以下参数来生成音频。")
                 with gr.Row():
-                    num_seeds_input = gr.Number(label="生成音频的数量", value=1, precision=0, visible=False)
-                    seed_input = gr.Number(label="指定种子（留空则随机）", value=None, precision=0)
-                    generate_audio_seed = gr.Button("\U0001F3B2")
+                    with gr.Column():
+                        gr.Markdown("音色选择")
+                        num_seeds_input = gr.Number(label="生成音频的数量", value=1, precision=0, visible=False)
+                        speaker_stat = gr.State(value="seed")
+                        tab_seed = gr.Tab(label="种子")
+                        with tab_seed:
+                            with gr.Row():
+                                seed_input = gr.Number(label="指定种子", info="种子决定音色 0则随机", value=None,
+                                                       precision=0)
+                                generate_audio_seed = gr.Button("\U0001F3B2")
+                        tab_roleid = gr.Tab(label="内置音色")
+                        with tab_roleid:
+                            roleid_input = gr.Dropdown(label="内置音色",
+                                                       choices=[("发姐", "1"),
+                                                                ("纯情男大学生", "2"),
+                                                                ("阳光开朗大男孩", "3"),
+                                                                ("知心小姐姐", "4"),
+                                                                ("电视台女主持", "5"),
+                                                                ("魅力大叔", "6"),
+                                                                ("优雅甜美", "7"),
+                                                                ("贴心男宝2", "21"),
+                                                                ("正式打工人", "8"),
+                                                                ("贴心男宝1", "9")],
+                                                       value="1",
+                                                       info="选择音色后会覆盖种子。感谢 @QuantumDriver 提供音色")
+                        tab_pt = gr.Tab(label="上传.PT文件")
+                        with tab_pt:
+                            pt_input = gr.File(label="上传音色文件", file_types=[".pt"], height=100)
 
                 with gr.Row():
-                    speed_input = gr.Slider(label="语速", minimum=1, maximum=10, value=5, step=1)
-                    oral_input = gr.Slider(label="口语化", minimum=0, maximum=9, value=2, step=1)
-
-                    laugh_input = gr.Slider(label="笑声", minimum=0, maximum=2, value=0, step=1)
-                    bk_input = gr.Slider(label="停顿", minimum=0, maximum=7, value=4, step=1)
+                    style_select = gr.Radio(label="预设参数", info="语速部分可自行更改",
+                                            choices=["小说朗读", "闲聊", "默认"], interactive=True, )
+                with gr.Row():
+                    # refine
+                    refine_text_input = gr.Checkbox(label="Refine",
+                                                    info="打开后会自动根据下方参数添加笑声/停顿等。关闭后可自行添加 [uv_break] [laugh] 或者点击下方 Refin按钮先行转换",
+                                                    value=True)
+                    speed_input = gr.Slider(label="语速", minimum=1, maximum=10, value=DEFAULT_SPEED, step=1)
+                with gr.Row():
+                    oral_input = gr.Slider(label="口语化", minimum=0, maximum=9, value=DEFAULT_ORAL, step=1)
+                    laugh_input = gr.Slider(label="笑声", minimum=0, maximum=2, value=DEFAULT_LAUGH, step=1)
+                    bk_input = gr.Slider(label="停顿", minimum=0, maximum=7, value=DEFAULT_BK, step=1)
                 # gr.Markdown("### 文本参数")
                 with gr.Row():
-                    min_length_input = gr.Number(label="文本分段长度", info="大于这个数值进行分段", value=120,
-                                                 precision=0)
-                    batch_size_input = gr.Number(label="批大小", info="同时处理的批次 越高越快 太高爆显存", value=5,
-                                                 precision=0)
+                    min_length_input = gr.Number(label="文本分段长度", info="大于这个数值进行分段",
+                                                 value=DEFAULT_SEG_LENGTH, precision=0)
+                    batch_size_input = gr.Number(label="批大小", info="越高越快 太高爆显存 4G推荐3 其他酌情",
+                                                 value=DEFAULT_BATCH_SIZE, precision=0)
                 with gr.Accordion("其他参数", open=False):
                     with gr.Row():
                         # 温度 top_P top_K
-                        temperature_input = gr.Slider(label="温度", minimum=0.01, maximum=1.0, step=0.01, value=0.3)
-                        top_P_input = gr.Slider(label="top_P", minimum=0.1, maximum=0.9, step=0.05, value=0.7)
-                        top_K_input = gr.Slider(label="top_K", minimum=1, maximum=20, step=1, value=20)
+                        temperature_input = gr.Slider(label="温度", minimum=0.01, maximum=1.0, step=0.01,
+                                                      value=DEFAULT_TEMPERATURE)
+                        top_P_input = gr.Slider(label="top_P", minimum=0.1, maximum=0.9, step=0.05, value=DEFAULT_TOP_P)
+                        top_K_input = gr.Slider(label="top_K", minimum=1, maximum=20, step=1, value=DEFAULT_TOP_K)
                         # reset 按钮
                         reset_button = gr.Button("重置")
 
@@ -369,6 +522,44 @@ with gr.Blocks() as demo:
                                   inputs=[],
                                   outputs=seed_input)
 
+
+        def do_tab_change(evt: gr.SelectData):
+            print(evt.selected, evt.index, evt.value, evt.target)
+            kv = {
+                "种子": "seed",
+                "内置音色": "role",
+                "上传.PT文件": "pt"
+            }
+            return kv.get(evt.value, "seed")
+
+
+        tab_seed.select(do_tab_change, outputs=speaker_stat)
+        tab_roleid.select(do_tab_change, outputs=speaker_stat)
+        tab_pt.select(do_tab_change, outputs=speaker_stat)
+
+
+        def do_style_select(x):
+            if x == "小说朗读":
+                return [4, 0, 0, 2]
+            elif x == "闲聊":
+                return [5, 5, 1, 4]
+            else:
+                return [DEFAULT_SPEED, DEFAULT_ORAL, DEFAULT_LAUGH, DEFAULT_BK]
+
+
+        # style_select 选择
+        style_select.change(
+            do_style_select,
+            inputs=style_select,
+            outputs=[speed_input, oral_input, laugh_input, bk_input]
+        )
+
+        # refine 按钮
+        refine_button.click(
+            generate_refine,
+            inputs=[text_file_input, oral_input, laugh_input, bk_input, temperature_input, top_P_input, top_K_input],
+            outputs=text_file_input
+        )
         # 重置按钮 重置温度等参数
         reset_button.click(
             lambda: [0.3, 0.7, 20],
@@ -391,9 +582,26 @@ with gr.Blocks() as demo:
                 temperature_input,
                 top_P_input,
                 top_K_input,
+                roleid_input,
+                refine_text_input,
+                speaker_stat,
+                pt_input
             ],
             outputs=[output_audio]
         )
+
+        break_button.click(
+            inser_token,
+            inputs=[text_file_input, break_button],
+            outputs=text_file_input
+        )
+
+        laugh_button.click(
+            inser_token,
+            inputs=[text_file_input, laugh_button],
+            outputs=text_file_input
+        )
+
     with gr.Tab("角色扮演"):
         def txt_2_script(text):
             lines = text.split("\n")
@@ -425,7 +633,7 @@ with gr.Blocks() as demo:
             characters = list([_["character"] for _ in lines])
             unique_characters = list(dict.fromkeys(characters))
             print([[character, 0] for character in unique_characters])
-            return [[character, 0] for character in unique_characters]
+            return [[character, 0, 5, 2, 0, 4] for character in unique_characters]
 
 
         def get_txt_characters(text):
@@ -463,7 +671,6 @@ with gr.Blocks() as demo:
             import itertools
             from tts_model import generate_audio_for_seed
             from utils import combine_audio, save_audio, normalize_zh
-            from config import DEFAULT_BATCH_SIZE, DEFAULT_SPEED, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P
 
             assert isinstance(models_seeds, pd.DataFrame)
 
@@ -476,18 +683,40 @@ with gr.Blocks() as demo:
                         break
                     yield batch
 
-            models_seeds = models_seeds.to_dict(orient='records')
+            column_mapping = {
+                '角色': 'character',
+                '种子': 'seed',
+                '语速': 'speed',
+                '口语': 'oral',
+                '笑声': 'laugh',
+                '停顿': 'break'
+            }
+            # 使用 rename 方法重命名 DataFrame 的列
+            models_seeds = models_seeds.rename(columns=column_mapping).to_dict(orient='records')
+            # models_seeds = models_seeds.to_dict(orient='records')
 
             # 检查每个角色是否都有对应的种子
-            for character, _ in characters:
-                if not any(seed['Character'] == character for seed in models_seeds):
-                    gr.Info(f"角色 {character} 没有种子，请先设置种子。")
-                    return None
+            print(models_seeds)
+            seed_lookup = {seed['character']: seed for seed in models_seeds}
 
-            # 将角色和对应的种子存为字典
-            character_seeds = {character: [seed['Seed'] for seed in models_seeds if seed['Character'] == character][0]
-                               for character, _ in characters}
-            # todo 可以自定义 最好是按角色
+            character_seeds = {}
+            missing_seeds = []
+            # 遍历所有角色
+            for character in characters:
+                character_name = character[0]
+                seed_info = seed_lookup.get(character_name)
+                if seed_info:
+                    character_seeds[character_name] = seed_info
+                else:
+                    missing_seeds.append(character_name)
+
+            if missing_seeds:
+                missing_characters_str = ', '.join(missing_seeds)
+                gr.Info(f"以下角色没有种子，请先设置种子：{missing_characters_str}")
+                return None
+
+            print(character_seeds)
+            # return
             refine_text_prompt = "[oral_2][laugh_0][break_4]"
             all_wavs = []
 
@@ -501,13 +730,21 @@ with gr.Blocks() as demo:
             batch_size = 5  # 设置批次大小
             # 按角色处理
             for character, lines in progress.tqdm(grouped_lines.items(), desc="生成剧本音频"):
-                seed = character_seeds.get(character, 0)
+                info = character_seeds[character]
+                seed = info["seed"]
+                speed = info["speed"]
+                orla = info["oral"]
+                laugh = info["laugh"]
+                bk = info["break"]
+
+                refine_text_prompt = f"[oral_{orla}][laugh_{laugh}][break_{bk}]"
+
                 # 按批次处理
                 for batch_lines in batch(lines, batch_size):
                     texts = [normalize_zh(line["txt"]) for line in batch_lines]
-                    print(f"seed={seed} t={texts} c={character}")
-                    wavs = generate_audio_for_seed(chat, int(seed), texts, DEFAULT_BATCH_SIZE, DEFAULT_SPEED,
-                                                   refine_text_prompt, DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
+                    print(f"seed={seed} t={texts} c={character} s={speed} r={refine_text_prompt}")
+                    wavs = generate_audio_for_seed(chat, int(seed), texts, DEFAULT_BATCH_SIZE, speed,
+                                                   refine_text_prompt, None, DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
                                                    DEFAULT_TOP_K, skip_save=True)  # 批量处理文本
                     batch_results[character].extend(wavs)
 
@@ -519,8 +756,7 @@ with gr.Blocks() as demo:
             # 合成所有音频
             audio = combine_audio(all_wavs)
             fname = f"script_{int(time.time())}.wav"
-            save_audio(fname, audio)
-            return fname
+            return save_audio(fname, audio)
 
 
         script_example = {
@@ -555,7 +791,7 @@ with gr.Blocks() as demo:
                 "txt": "当小红帽到达奶奶家时，她发现大灰狼伪装成了奶奶。",
                 "character": "旁白"
             }, {
-                "txt": "小红帽疑惑地问",
+                "txt": "小红帽疑惑的问",
                 "character": "旁白"
             }, {
                 "txt": "奶奶，你的耳朵怎么这么尖？",
@@ -604,7 +840,7 @@ with gr.Blocks() as demo:
                                                        placeholder="请输入API Base URL",
                                                        value=r"https://api.openai.com/v1")
                     openai_api_key_input = gr.Textbox(label="OpenAI API Key", placeholder="请输入API Key",
-                                                      value="sk-xxxxxxx")
+                                                      value="sk-xxxxxxx", type="password")
                 # AI提示词
                 ai_text_input = gr.Textbox(label="剧情简介或者一段故事", placeholder="请输入文本...", lines=2,
                                            value=ai_text_default)
@@ -615,7 +851,7 @@ with gr.Blocks() as demo:
             with gr.Column(scale=3):
                 gr.Markdown("### 脚本")
                 gr.Markdown(
-                    "脚本可以手工编写也可以从右侧的AI脚本生成按钮生成。脚本格式 **角色::文本** 一行为一句” 注意是::")
+                    "脚本可以手工编写也可以从左侧的AI脚本生成按钮生成。脚本格式 **角色::文本** 一行为一句” 注意是::")
                 script_text = "\n".join(
                     [f"{_.get('character', '')}::{_.get('txt', '')}" for _ in script_example['lines']])
 
@@ -627,20 +863,20 @@ with gr.Blocks() as demo:
             with gr.Column(scale=1):
                 gr.Markdown("### 角色种子")
                 # DataFrame 来存放转换后的脚本
-                # 默认数据
+                # 默认数据 [speed_5][oral_2][laugh_0][break_4]
                 default_data = [
-                    ["旁白", 2222],
-                    ["年轻女性", 2],
-                    ["中年男性", 2424]
+                    ["旁白", 2222, 3, 0, 0, 2],
+                    ["年轻女性", 2, 5, 2, 0, 2],
+                    ["中年男性", 2424, 5, 2, 0, 2]
                 ]
 
                 script_data = gr.DataFrame(
                     value=default_data,
                     label="角色对应的音色种子，从抽卡那获取",
-                    headers=["Character", "Seed"],
-                    datatype=["str", "number"],
+                    headers=["角色", "种子", "语速", "口语", "笑声", "停顿"],
+                    datatype=["str", "number", "number", "number", "number", "number"],
                     interactive=True,
-                    col_count=(2, "fixed"),
+                    col_count=(6, "fixed"),
                 )
                 # 生视频按钮
                 script_generate_audio = gr.Button("步骤②：生成音频")
@@ -673,4 +909,4 @@ with gr.Blocks() as demo:
             outputs=[script_audio]
         )
 
-demo.launch(share=args.share)
+demo.launch(share=args.share, inbrowser=True)
